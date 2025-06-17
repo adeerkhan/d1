@@ -1,11 +1,29 @@
 import torch
 import torch.nn.functional as F
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
 from transformers import DefaultDataCollator
 import random
 from tqdm import tqdm
 import pickle
 import torch.distributed as dist
+import sys
+import os
+import math
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from rplan_data_coordtok import pretty_token, TokenizationSchema
+
+
+class LogMetricsCallback(TrainerCallback):
+    """A custom callback to log weight norm."""
+
+    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+        if logs is not None and state.is_world_process_zero and model is not None:
+            weight_norm = 0.0
+            for param in model.parameters():
+                if param.requires_grad:
+                    weight_norm += torch.norm(param.data).item() ** 2
+            logs["weight_norm"] = weight_norm**0.5
 
 
 class dLLMTrainer(Trainer):
@@ -13,7 +31,11 @@ class dLLMTrainer(Trainer):
         """
         Absorbing state diffusion loss computation
         """
-        labels, t, num_prompt_tokens = inputs.pop("labels"), inputs.pop("t"), inputs.pop("num_prompt_tokens")
+        labels, t, num_prompt_tokens = (
+            inputs.pop("labels"),
+            inputs.pop("t"),
+            inputs.pop("num_prompt_tokens"),
+        )
         outputs = model(**inputs)
         logits = outputs.logits
         unscaled_loss = F.cross_entropy(
@@ -24,6 +46,23 @@ class dLLMTrainer(Trainer):
         loss = unscaled_loss / t
         loss = loss.sum() / (inputs["input_ids"].numel() - num_prompt_tokens)
         return loss if not return_outputs else (loss, outputs)
+
+    def compute_metrics(self, eval_pred):
+        logits, labels = eval_pred.predictions, eval_pred.label_ids
+        if isinstance(logits, tuple):
+            logits = logits[0]
+
+        labels = torch.from_numpy(labels).to(logits.device).long()
+
+        loss_fct = torch.nn.CrossEntropyLoss()
+        loss = loss_fct(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
+
+        try:
+            perplexity = math.exp(loss.item())
+        except OverflowError:
+            perplexity = float("inf")
+
+        return {"perplexity": perplexity}
 
 
 class dLLMSFTDataset(torch.utils.data.Dataset):
@@ -100,31 +139,42 @@ class dLLMDataCollator(DefaultDataCollator):
         return batch
 
 
-SYSTEM_PROMPT = """
-Respond in the following format:
-<reasoning>
-Your reasoning here
-</reasoning>
-<answer>
-...
-</answer>
-"""
-
-
-def preprocess_dataset(data, tokenizer, max_length, test_split=0.01):
+def preprocess_dataset(data: torch.utils.data.Dataset, tokenizer, max_length, test_split=0.01):
     preprocessed_data = []
+    schema = data.schema
+
     for i in tqdm(range(len(data)), desc="Preprocessing dataset"):
-        question = SYSTEM_PROMPT + "\n\n" + data[i]["question"]
-        trajectory = f"<reasoning>{data[i]['thinking_trajectories'][0]}</reasoning>\n<answer>{data[i]['attempt']}</answer>"
+        sample = data[i]
+        question = sample["caption"]
+
+        floorplan_tokens = sample["input_ids"]
+        actual_tokens = floorplan_tokens[floorplan_tokens != schema.PAD_TOKEN].tolist()
+
+        if actual_tokens and actual_tokens[0] == schema.BOS_TOKEN:
+            actual_tokens.pop(0)
+        if actual_tokens and actual_tokens[-1] == schema.EOS_TOKEN:
+            actual_tokens.pop()
+
+        answer = " ".join([pretty_token(tok, schema) for tok in actual_tokens])
+
         prompt = [{"role": "user", "content": question}]
-        response = [{"role": "assistant", "content": trajectory}]
+        response = [{"role": "assistant", "content": answer}]
+
         inputs = tokenizer.apply_chat_template(prompt + response, tokenize=False)
-        prompt = tokenizer.apply_chat_template(prompt, tokenize=False) + "\n"
+        prompt_str = tokenizer.apply_chat_template(prompt, tokenize=False) + "\n"
+
         tokenized_input = tokenizer(
-            inputs, return_tensors="pt", truncation=True, max_length=max_length, padding="max_length"
+            inputs,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+            padding="max_length",
         ).input_ids.squeeze(0)
-        num_tokens = tokenized_input.shape[0]
-        tokenized_prompt = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length)
+
+        tokenized_prompt = tokenizer(
+            prompt_str, return_tensors="pt", truncation=True, max_length=max_length
+        )
+
         preprocessed_data.append(
             {
                 "input_ids": tokenized_input,
@@ -133,6 +183,7 @@ def preprocess_dataset(data, tokenizer, max_length, test_split=0.01):
         )
 
     random.shuffle(preprocessed_data)
-    test_data = preprocessed_data[: int(len(preprocessed_data) * test_split)]
-    train_data = preprocessed_data[int(len(preprocessed_data) * test_split) :]
+    test_size = int(len(preprocessed_data) * test_split)
+    test_data = preprocessed_data[:test_size]
+    train_data = preprocessed_data[test_size:]
     return train_data, test_data

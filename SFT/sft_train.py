@@ -9,6 +9,25 @@ from sft_trainer import *
 import torch.distributed as dist
 import random
 import numpy as np
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from rplan_data_coordtok import RPlanDataset, TokenizationSchema
+
+
+class TrainingConfig:
+    model_name = "GSAI-ML/LLaDA-8B-Instruct"
+    batch_size = 1  
+    max_length = 2048
+    num_epochs = 25
+    learning_rate = 2e-5
+    grad_accum_steps = 4
+    output_dir = "./rplan_sft_checkpoints"
+    job_name = "rplan-diffusion-sft-run1"
+    train_data = "../dataset"
+    debugging = False
+
+args = TrainingConfig()
 
 
 def init_seed(seed):
@@ -20,37 +39,6 @@ def init_seed(seed):
     torch.backends.cudnn.deterministic = True
 
 
-# Initialize argument parser
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    # Hyperparameters
-    parser.add_argument(
-        "--model_name", type=str, default="GSAI-ML/LLaDA-8B-Instruct", help="Name of the pretrained model"
-    )
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for training")
-    parser.add_argument(
-        "--max_length", type=int, default=4096, help="Maximum sequence length for tokenization"
-    )
-    parser.add_argument("--num_epochs", type=int, default=20, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for the optimizer")
-    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Gradient accumulation steps")
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/data0/devaansh",
-        help="Directory to save model checkpoints and logs",
-    )
-    parser.add_argument("--job_name", type=str, default="llada-s1", help="Job Name")
-    parser.add_argument("--train_data", type=str, default="simplescaling/s1K", help="Path to training data")
-    parser.add_argument(
-        "--debugging", action="store_true", help="Use while debugging model - only disables wandb logging"
-    )
-
-    return parser.parse_args()
-
-
-# Model loading with LoRA integration
 def load_model_and_tokenizer(args):
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -83,8 +71,13 @@ def load_model_and_tokenizer(args):
 
 # Dataset loading
 def load_data(args, tokenizer):
-    data = load_dataset(args.train_data, split="train")
-    train_data, eval_data = preprocess_dataset(data, tokenizer, args.max_length)
+    full_dataset = RPlanDataset(
+        root_dir=args.train_data,
+        tokenizer=TokenizationSchema(),
+        max_seq_len=args.max_length,
+        augment=True,  # Enable augmentations
+    )
+    train_data, eval_data = preprocess_dataset(full_dataset, tokenizer, args.max_length)
     print("Train data length: ", len(train_data))
     print("Eval data length: ", len(eval_data))
     train_dataset = dLLMSFTDataset(train_data, tokenizer, args.max_length)
@@ -130,6 +123,7 @@ def train_model(args, tokenizer, model):
         data_collator=dLLMDataCollator(tokenizer=tokenizer, mask_token_id=126336, max_length=args.max_length),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        callbacks=[LogMetricsCallback],
     )
 
     # Start training
@@ -138,11 +132,7 @@ def train_model(args, tokenizer, model):
 
 if __name__ == "__main__":
     init_seed(42)
-    # Parse command-line arguments
-    args = parse_args()
-
-    # Load model and tokenizer
+    
     tokenizer, model = load_model_and_tokenizer(args)
 
-    # Train the model
     train_model(args, tokenizer, model)
